@@ -1,0 +1,180 @@
+services:
+  # Langfuse 主要的前端與 API 伺服器
+  langfuse-web:
+    image: langfuse/langfuse:3
+    container_name: langfuse-web
+    restart: unless-stopped
+    # 宣告 yaml anchor: &langfuse-depends-on，供 worker 重複使用
+    depends_on: &langfuse-depends-on
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    # 宣告 yaml anchor: &langfuse-env，把底下所有變數打包，並命名為 langfuse-env，供 worker 重複使用
+    environment: &langfuse-env
+      TZ: ${TZ:-Asia/Taipei}
+      NODE_ENV: production
+      NEXTAUTH_URL: ${LANGFUSE_PUBLIC_URL}
+      NEXTAUTH_SECRET: ${NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY}
+
+      # Postgres 資料庫連線字串
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+
+      # ClickHouse 分析型資料庫連線設定
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:9000
+      CLICKHOUSE_CLUSTER_ENABLED: ${CLICKHOUSE_CLUSTER_ENABLED:-false}
+
+      # -----------------------------------------------------------------
+      # S3 / MinIO 物件儲存設定 (Langfuse V3 必須強制啟用)
+      # -----------------------------------------------------------------
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+
+      # Redis 快取與任務佇列連線
+      REDIS_CONNECTION_STRING: redis://redis:6379
+
+      # Langfuse 進階/遙測設定 (可選)
+      TELEMETRY_ENABLED: "false"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "false"
+
+      # Langfuse 初始化的預設組織與專案設定
+      LANGFUSE_INIT_ORG_ID: ${LANGFUSE_INIT_ORG_ID}
+      LANGFUSE_INIT_ORG_NAME: ${LANGFUSE_INIT_ORG_NAME}
+      LANGFUSE_INIT_PROJECT_ID: ${LANGFUSE_INIT_PROJECT_ID}
+      LANGFUSE_INIT_PROJECT_NAME: ${LANGFUSE_INIT_PROJECT_NAME}
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_INIT_PROJECT_PUBLIC_KEY}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_INIT_PROJECT_SECRET_KEY}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD}
+    ports:
+      - "${LANGFUSE_PORT:-3000}:3000"
+
+  # Langfuse 背景任務處理器 (處理非同步任務、資料流管線等)
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: langfuse-worker
+    restart: unless-stopped
+    # 使用 * 直接完全繼承 Web 的依賴項目
+    depends_on: *langfuse-depends-on
+    environment:
+      # 使用 <<: * 解壓縮名為 langfuse-env 的包裹，並把內容全倒進來
+      <<: *langfuse-env
+
+  # PostgreSQL 關聯式資料庫 (儲存使用者、專案、Prompt等中繼核心資料)
+  postgres:
+    image: postgres:16
+    container_name: langfuse-postgres
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Taipei}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      # 使用 Named Volume 取代 Bind Mount，確保 Mac 下的讀寫效能，同時解決 Linux 的資料夾 UID 權限問題
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ClickHouse 列式分析型資料庫 (高效能，專門負責儲存巨量的 Traces 追蹤日誌與觀測數據)
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: langfuse-clickhouse
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Taipei}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      # 使用 Named Volume 以優化效能
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    healthcheck:
+      test: [ "CMD-SHELL", "wget --spider -q http://127.0.0.1:8123/ping || exit 1" ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  # Redis (作為記憶體快取，以及 Web 與 Worker 之間溝通的背景任務佇列)
+  redis:
+    image: redis:7-alpine
+    container_name: langfuse-redis
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Taipei}
+    # 開啟 AOF 持久化，就算 Redis 意外重啟也不會遺失尚未處理的佇列任務
+    command: [ "redis-server", "--appendonly", "yes" ]
+    volumes:
+      # 使用 Named Volume 以優化效能
+      - langfuse_redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # MinIO 物件儲存 (Object Storage) - S3 的本地端替代方案，提供 Langfuse V3 上傳事件和附件
+  minio:
+    image: cgr.dev/chainguard/minio
+    container_name: langfuse-minio
+    restart: unless-stopped
+    entrypoint: sh
+    # 啟動前強制建立 langfuse 要使用的預設 bucket
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      TZ: ${TZ:-Asia/Taipei}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - langfuse_minio_data:/data
+    ports:
+      - "9090:9000"
+      - "9091:9001"
+    healthcheck:
+      test: [ "CMD", "mc", "ready", "local" ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+# 定義 Docker Named Volumes（交由 Docker Engine 管理真實的系統檔案路徑，確保雙平台一致體驗與最高效能）
+volumes:
+  langfuse_postgres_data:
+    driver: local
+  langfuse_clickhouse_data:
+    driver: local
+  langfuse_redis_data:
+    driver: local
+  langfuse_minio_data:
+    driver: local
