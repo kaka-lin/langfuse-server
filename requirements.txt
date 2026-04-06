@@ -1,0 +1,4 @@
+langfuse
+python-dotenv
+google-genai
+pytest
